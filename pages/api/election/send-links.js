@@ -5,12 +5,24 @@ import { loadOwnedElection } from "@/lib/authz";
 import { generateToken, hashToken } from "@/lib/crypto";
 import { decryptEmail } from "@/lib/fle";
 import { sendMail } from "@/lib/email";
+import { z } from "zod";
+
+const SendLinksSchema = z.object({
+  electionId: z.string().regex(/^[0-9a-fA-F]{24}$/, "Invalid election ID"),
+});
 
 export default requireAuth(async (req, res) => {
   if (req.method !== "POST") return res.status(405).end();
+
+  const result = SendLinksSchema.safeParse(req.body);
+  if (!result.success) {
+    return res.status(400).json({ error: "Invalid request data", details: result.error.format() });
+  }
+
   await connectDB();
-  const owned = await loadOwnedElection(req.body.electionId, req.user.id);
+  const owned = await loadOwnedElection(result.data.electionId, req.user.id);
   if (!owned) return res.status(404).json({ error: "Election not found" });
+
   const { election } = owned;
   const electionId = election._id;
   if (election.status !== "ACTIVE")
@@ -18,15 +30,18 @@ export default requireAuth(async (req, res) => {
       error: "Election must be ACTIVE (all 3 committee approvals submitted) before voting links can be sent",
     });
 
-  const voters = await Voter.find({ electionId, hasVoted: false });
+  // Only target voters who have not yet had a link generated to protect valid, unused tokens from invalidation
+  const voters = await Voter.find({ electionId, hasVoted: false, linkSentAt: null });
   const expiresAt = election.endTime || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
   let sent = 0;
+
   for (const voter of voters) {
     const token = generateToken();
     voter.tokenHash = hashToken(token);
     voter.tokenExpiresAt = expiresAt;
     voter.linkSentAt = new Date();
     await voter.save();
+
     const link = `${process.env.APP_URL || "http://localhost:3000"}/vote/${token}`;
     const verifyLink = `${process.env.APP_URL || "http://localhost:3000"}/verify`;
     await sendMail(

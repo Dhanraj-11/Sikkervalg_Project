@@ -3,23 +3,35 @@ import Voter from "@/models/Voter";
 import Election from "@/models/Election";
 import Candidate from "@/models/Candidate";
 import { hashToken } from "@/lib/crypto";
+import { z } from "zod";
+
+const InfoSchema = z.object({
+  token: z.string().length(64, "Invalid token format"),
+});
+
+const GENERIC_ERROR = "Invalid, expired, or already-used voting link";
 
 // Public route (no requireAuth) — identity here comes from possession of the
 // raw token, never from a session/JWT. BE-21: this is the "blind" entry point;
 // it only ever looks up the voters collection, never the ballots collection.
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end();
+
+  const result = InfoSchema.safeParse(req.body);
+  if (!result.success) {
+    return res.status(400).json({ error: GENERIC_ERROR });
+  }
+
   await connectDB();
-  const { token } = req.body || {};
-  if (!token) return res.status(400).json({ error: "Invalid link" });
+  const { token } = result.data;
 
   const voter = await Voter.findOne({ tokenHash: hashToken(token) });
   // BE-19: generic error only — never distinguish "no such token" from
   // "already voted" from "bad format", since that leaks state to an attacker
   // probing tokens.
-  if (!voter || voter.hasVoted) return res.status(400).json({ error: "Invalid or already-used link" });
-  if (voter.tokenExpiresAt && voter.tokenExpiresAt < new Date())
-    return res.status(400).json({ error: "This voting link has expired" });
+  if (!voter || voter.hasVoted || (voter.tokenExpiresAt && voter.tokenExpiresAt < new Date())) {
+    return res.status(400).json({ error: GENERIC_ERROR });
+  }
 
   const election = await Election.findById(voter.electionId);
   if (!election || election.status !== "ACTIVE")

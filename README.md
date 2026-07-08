@@ -115,6 +115,7 @@ DRAFT ───────────────► ACTIVE ──────
   everywhere") + bcrypt password hashing
 - **Email:** Resend (recommended for serverless) or SMTP/Nodemailer, with a
   console-log fallback in development
+- **Validation:** Zod (for request payload and query schema safety)
 - **PDF generation/signing:** PDFKit + Node's built-in `crypto` (RSA-PSS)
 - **Scheduled jobs:** Vercel Cron (ballot flushing every 5 minutes, PII
   shredding nightly)
@@ -197,6 +198,9 @@ comments throughout `lib/` and `pages/api/` reference specific findings
 (e.g. `BE-01`, `BE-14`, `FE-07`) with the reasoning behind each fix. A few
 things worth knowing before deploying this for a real election:
 
+- **Transactional Integrity:** The election close sequence (status update, sweeping staged votes, and computing tallies) runs within a single atomic transaction session to prevent race conditions and vote loss.
+- **Limiter Concurrency Resilience:** The Mongo-backed rate limiter intercepts duplicate key insertion errors (code 11000) under concurrent loads and retries once to guarantee uptime.
+- **Request Validation:** All mutating API routes validate bodies/queries with Zod schemas to block invalid data formats at the boundary.
 - Multi-document transactions require a MongoDB **replica set**.
 - Production **fails closed**: missing `FIELD_ENCRYPTION_KEY`,
   `PROTOCOL_SIGNING_*_PEM`, or an email provider will throw on startup
