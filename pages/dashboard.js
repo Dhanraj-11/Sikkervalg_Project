@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import Head from "next/head";
 import { useRouter } from "next/router";
 import { api } from "@/lib/api";
@@ -140,7 +140,16 @@ export default function Dashboard() {
       const { orgs } = await api("/org/list", {}, token);
       setOrgs(orgs);
       setOrg(null);
-      setStage(orgs.length ? "org-picker" : "org-form");
+      // One HR account can only ever own one organization now, so there's
+      // nothing to actually "pick" in the normal case — skip straight to
+      // that org's elections. The picker screen only still shows up if
+      // there happen to be multiple orgs on file (e.g. from before this
+      // rule existed), as a safe fallback rather than a hard crash.
+      if (orgs.length === 1) {
+        await loadElections(orgs[0]);
+      } else {
+        setStage(orgs.length ? "org-picker" : "org-form");
+      }
     } catch (e) { fail(e.message); } finally { setPending(null); }
   }
 
@@ -308,11 +317,25 @@ export default function Dashboard() {
     } catch (e) { fail(e.message); } finally { setPending(null); }
   }
 
-  // Auto-advance the open accordion step to the first incomplete one whenever
-  // the underlying election data changes (e.g. right after loading/resuming,
-  // or after an action completes and a step becomes done).
+  // Auto-advance the open accordion step to the first incomplete one — but
+  // only the first time we land on a given election (initial load/resume),
+  // not every time committee/candidates/voters change. Without the guard,
+  // adding one candidate (or one committee invite, or one voter) would
+  // immediately bounce the user forward to the next step the instant it had
+  // *any* items, making it impossible to add several candidates, several
+  // committee members, etc. in a row without manually scrolling back each
+  // time.
+  const autoAdvancedKey = useRef(null);
   useEffect(() => {
     if (stage !== "workspace" || !election) return;
+    // Re-run on election switch AND on status transitions (e.g. the moment
+    // it goes DRAFT -> ACTIVE after the 3rd approval, it's worth jumping to
+    // "links"). It deliberately does NOT re-run just because
+    // committee/candidates/votersTotal changed within the same status, so
+    // adding a 2nd/3rd item in a row doesn't yank the user away.
+    const key = `${election._id}:${election.status}`;
+    if (autoAdvancedKey.current === key) return;
+    autoAdvancedKey.current = key;
     const s3 = committee.length > 0;
     const s4 = candidates.length > 0;
     const s5 = votersTotal > 0;
@@ -540,7 +563,7 @@ export default function Dashboard() {
         <div className="shell-sidebar-context">
           <div className="shell-sidebar-context-label">Organization</div>
           <div className="shell-sidebar-context-value">{org.name}</div>
-          <button type="button" className="link-btn" onClick={loadOrgs}>Switch</button>
+          {orgs.length > 1 && <button type="button" className="link-btn" onClick={loadOrgs}>Switch</button>}
         </div>
 
         <div className="shell-sidebar-context">

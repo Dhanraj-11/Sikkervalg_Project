@@ -6,7 +6,6 @@ const UserSchema = new mongoose.Schema(
     email: { type: String, required: true, unique: true },
     password: String,
     role: { type: String, enum: ["hr", "committee"], default: "hr" },
-    organizationId: { type: mongoose.Schema.Types.ObjectId, ref: "Organization" },
     // Bumped to invalidate every outstanding JWT for this user at once
     // (password change, "log out everywhere"). See lib/auth.js requireAuth.
     tokenVersion: { type: Number, default: 0 },

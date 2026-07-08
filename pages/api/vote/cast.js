@@ -6,44 +6,51 @@ import Candidate from "@/models/Candidate";
 import BallotStaging from "@/models/BallotStaging";
 import { hashToken, generateTrackerId } from "@/lib/crypto";
 import { enforceRateLimit, clientIp } from "@/lib/rateLimit";
-import { z } from "zod";
-
-const CastVoteSchema = z.object({
-  token: z.string().length(64, "Invalid token format"),
-  candidateId: z.string().regex(/^[0-9a-fA-F]{24}$/, "Invalid candidate ID").nullable().optional(),
-  blank: z.boolean().optional(),
-  website: z.string().max(0, "Honeypot filled").optional(),
-}).refine((data) => data.blank || data.candidateId, {
-  message: "Must either vote blank or select a candidate",
-});
 
 // This is the heart of BE-01/BE-06/BE-21: token consumption (identity side)
 // and ballot creation (choice side) happen inside one MongoDB transaction,
 // but write to two collections that share no linking field. If anything
 // fails, the whole transaction rolls back — a voter can never end up
 // "consumed" without a ballot existing, or vice versa.
+//
+// BE-03: the ballot side writes to BallotStaging, not the real Ballot chain.
+// Writing to the real, publicly-auditable ledger at this exact instant would
+// let anyone watching the database correlate this Voter update with the new
+// Ballot row purely by timestamp. A separate periodic job moves staged
+// ballots into the real chain later, in shuffled batches — see
+// lib/ballotFlush.js.
+//
+// NOTE: multi-document transactions require MongoDB running as a replica set
+// (Atlas gives you this by default; a bare standalone `mongod` does not).
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end();
 
+  // Tokens are 256-bit random, so brute force is infeasible either way —
+  // this is mainly a backstop against scripted spam/DoS hammering the
+  // transaction path (each attempt opens a Mongo session).
   if (await enforceRateLimit(req, res, "vote-cast", clientIp(req), { max: 30, windowMs: 10 * 60 * 1000 })) return;
 
-  const result = CastVoteSchema.safeParse(req.body);
-  if (!result.success) {
-    if (result.error.issues.some((issue) => issue.message === "Honeypot filled")) {
-      console.warn("[honeypot] blocked vote submission with filled trap field");
-    }
+  await connectDB();
+  const { token, candidateId, blank, website } = req.body || {};
+  if (website) {
+    // FE-15: hidden field only a bot/extension would fill in. Log for
+    // monitoring, reject with the same generic message real errors use —
+    // never reveal that honeypot detection exists.
+    console.warn("[honeypot] blocked vote submission with filled trap field");
     return res.status(400).json({ error: "Unable to record vote" });
   }
+  if (!token || (!candidateId && !blank)) return res.status(400).json({ error: "Invalid request" });
 
-  const { token, candidateId, blank } = result.data;
-
-  await connectDB();
   const session = await mongoose.startSession();
   try {
     let trackerId;
 
+    // BE-22: tight timeouts so a dropped serverless connection rolls back
+    // cleanly instead of leaving the transaction open.
     await session.withTransaction(
       async () => {
+        // BE-06: atomic find+consume. If another request already consumed this
+        // token between page-load and submit, this simply matches nothing.
         const voter = await Voter.findOneAndUpdate(
           { tokenHash: hashToken(token), hasVoted: false, tokenExpiresAt: { $gt: new Date() } },
           { $set: { hasVoted: true }, $unset: { tokenHash: "" } },
@@ -61,6 +68,9 @@ export default async function handler(req, res) {
           candidateObjId = candidate._id;
         }
 
+        // BE-03: tracker ID is generated independently here (not derived from
+        // a chain hash) because the chain hash itself isn't computed until
+        // this vote is later flushed out of staging — see lib/ballotFlush.js.
         trackerId = generateTrackerId();
 
         await BallotStaging.create(
@@ -79,9 +89,12 @@ export default async function handler(req, res) {
       { maxCommitTimeMS: 5000, wtimeoutMS: 5000 }
     );
 
+    // FE-07: this is the one and only place the tracker ID is ever returned.
     res.status(201).json({ trackerId });
   } catch (err) {
-    res.status(400).json({ error: "Unable to record vote" });
+    const known = ["INVALID_TOKEN", "ELECTION_NOT_ACTIVE", "INVALID_CANDIDATE"];
+    // BE-19: sanitized generic error to the client regardless of which branch failed.
+    res.status(400).json({ error: known.includes(err.message) ? "Unable to record vote" : "Unable to record vote" });
   } finally {
     session.endSession();
   }

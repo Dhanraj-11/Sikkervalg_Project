@@ -18,9 +18,9 @@ export default function CommitteeJoin() {
     setErr("");
     setSubmitting(true);
     try {
-      const { token } = await api("/committee/join", { token: joinToken, ...form });
+      const { token, electionId } = await api("/committee/join", { token: joinToken, ...form });
       localStorage.setItem("token", token);
-      router.push("/committee/approve");
+      router.push(electionId ? `/committee/approve?electionId=${electionId}` : "/committee/approve");
     } catch (e) {
       setErr(e.message);
       setSubmitting(false);

@@ -6,37 +6,39 @@ import User from "@/models/User";
 import { hashPw, checkPw, signToken, validatePassword } from "@/lib/auth";
 import { enforceRateLimit, clientIp } from "@/lib/rateLimit";
 import { hashToken } from "@/lib/crypto";
-import { z } from "zod";
-
-const JoinCommitteeSchema = z.object({
-  token: z.string().length(64, "Invalid token format"),
-  name: z.string().min(2, "Name must be at least 2 characters").max(100).optional(),
-  password: z.string().min(10, "Password must be at least 10 characters").max(100).optional(),
-});
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end();
 
   if (await enforceRateLimit(req, res, "committee-join", clientIp(req), { max: 10, windowMs: 60 * 60 * 1000 })) return;
 
-  const result = JoinCommitteeSchema.safeParse(req.body);
-  if (!result.success) {
-    return res.status(400).json({ error: "Invalid request data", details: result.error.format() });
-  }
-
-  const { token: rawToken, name, password } = result.data;
-
   await connectDB();
+  const { token: rawToken, name, password } = req.body || {};
+  if (!rawToken) return res.status(400).json({ error: "Invalid request" });
+
+  // Looked up by the hash of a 256-bit token that only ever existed in the
+  // invite email — not by the Committee document's own _id, which is
+  // guessable-ish (embeds a timestamp) and was previously exposed back to
+  // the HR admin's dashboard. Possessing the emailed link is what proves
+  // this is really the invited person.
   const committee = await Committee.findOne({ tokenHash: hashToken(rawToken) });
   if (!committee) return res.status(404).json({ error: "Invalid invite" });
   if (committee.userId) return res.status(400).json({ error: "This invite has already been used" });
 
+  // Committee members exist to approve the roll/candidates before voting
+  // opens — once the election has moved past DRAFT (active or closed), an
+  // invite link is no longer meaningful. Same "locked once it starts"
+  // boundary already used for candidates/voter roll uploads.
   const election = await Election.findById(committee.electionId).select("status").lean();
   if (!election || election.status !== "DRAFT") {
     return res.status(400).json({ error: "This election has already started — committee invites are no longer valid" });
   }
 
-  // Case 1: authenticated join
+  // Case 1: the invite was opened while already signed in (e.g. an HR admin
+  // clicking their own committee invite, or someone who already joined a
+  // different election's committee with this same email). Link the invite
+  // to that existing, already-authenticated account — no password needed,
+  // and no attempt to create a second User row for the same email.
   const bearer = req.headers.authorization?.split(" ")[1];
   if (bearer) {
     try {
@@ -45,15 +47,18 @@ export default async function handler(req, res) {
       if (existingUser && existingUser.email === committee.email) {
         committee.userId = existingUser._id;
         await committee.save();
-        return res.status(200).json({ token: signToken(existingUser) });
+        return res.status(200).json({ token: signToken(existingUser), electionId: committee.electionId });
       }
     } catch {
-      // ignore and fall through
+      // invalid/expired token — fall through to the anonymous flow below
     }
   }
 
-  // Case 2: password verification
-  if (!password) return res.status(400).json({ error: "Password is required" });
+  // Case 2: anonymous join with a password. If a User with this email
+  // already exists (same scenario as above, just not currently logged in),
+  // verify the password instead of failing with a duplicate-key error —
+  // that proves ownership of the existing account and links it.
+  if (!password) return res.status(400).json({ error: "Invalid request" });
   const passwordError = validatePassword(password);
   if (passwordError) return res.status(400).json({ error: passwordError });
 
@@ -67,15 +72,18 @@ export default async function handler(req, res) {
     }
     committee.userId = existingByEmail._id;
     await committee.save();
-    return res.status(200).json({ token: signToken(existingByEmail) });
+    return res.status(200).json({ token: signToken(existingByEmail), electionId: committee.electionId });
   }
 
   try {
     const user = await User.create({ name, email: committee.email, password: await hashPw(password), role: "committee" });
     committee.userId = user._id;
     await committee.save();
-    res.status(201).json({ token: signToken(user) });
+    res.status(201).json({ token: signToken(user), electionId: committee.electionId });
   } catch (err) {
+    // Race: two requests hit the "no existing user" branch at once. Whoever
+    // loses now genuinely needs to retry rather than being told to log in
+    // with a password they haven't set yet.
     if (err.code === 11000) return res.status(409).json({ error: "That was just claimed by another request — please try again" });
     res.status(500).json({ error: "Unable to complete signup" });
   }
